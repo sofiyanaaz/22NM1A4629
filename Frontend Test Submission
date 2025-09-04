@@ -1,1 +1,362 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { BrowserRouter, Routes, Route, Link, useNavigate, useParams } from "react-router-dom";
+
+class Logger {
+  constructor() {
+    this.events = [];
+  }
+  log(level, message, meta = {}) {
+    this.events.push({ id: crypto.randomUUID(), ts: Date.now(), level, message, meta });
+  }
+  info(message, meta) { this.log("INFO", message, meta); }
+  warn(message, meta) { this.log("WARN", message, meta); }
+  error(message, meta) { this.log("ERROR", message, meta); }
+  getAll() { return [...this.events]; }
+  clear() { this.events = []; }
+}
+const logger = new Logger();
+
+const STORAGE_KEY = "urlshortener.store.v1";
+function now() { return Date.now(); }
+function minutes(n) { return n * 60 * 1000; }
+function loadStore() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return { byCode: {} };
+  try { return JSON.parse(raw); } catch { return { byCode: {} }; }
+}
+function saveStore(store) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+}
+function base62(n) {
+  const chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let s = "";
+  while (n > 0) { s = chars[n % 62] + s; n = Math.floor(n / 62); }
+  return s || "0";
+}
+function randomCode(len = 6) {
+  const chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let s = "";
+  for (let i = 0; i < len; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+// Middleware wrapper to satisfy the “Mandatory Logging Integration”
+function withLogging(api) {
+  const wrap = (fnName) => async (...args) => {
+    const callId = crypto.randomUUID();
+    logger.info("API_CALL_START", { callId, fn: fnName, args });
+    const t0 = now();
+    try {
+      const res = await api[fnName](...args);
+      const dt = now() - t0;
+      logger.info("API_CALL_SUCCESS", { callId, fn: fnName, ms: dt, resultPreview: preview(res) });
+      return res;
+    } catch (e) {
+      const dt = now() - t0;
+      logger.error("API_CALL_ERROR", { callId, fn: fnName, ms: dt, error: String(e?.message || e) });
+      throw e;
+    }
+  };
+  const out = {};
+  for (const k of Object.keys(api)) out[k] = wrap(k);
+  return out;
+}
+function preview(x) {
+  try { return JSON.stringify(x)?.slice(0, 200); } catch { return String(x); }
+}
+
+// "Database" shape: { byCode: { [code]: { code, url, createdAt, expiresAt, hits } } }
+const rawApi = {
+  async createShort({ url, validityMinutes, customCode }) {
+    // Validate inputs
+    if (!/^https?:\/\/.+/.test(url)) throw new Error("Please enter a valid http(s) URL");
+
+    const store = loadStore();
+    const vMin = Number.isInteger(+validityMinutes) && +validityMinutes > 0 ? +validityMinutes : 30; // default 30
+
+    let code = (customCode || "").trim();
+    if (code) {
+      if (!/^[a-zA-Z0-9]{4,16}$/.test(code)) throw new Error("Custom code must be 4-16 alphanumeric characters");
+      if (store.byCode[code]) throw new Error("That shortcode is already taken. Try another.");
+    } else {
+      // auto-generate unique
+      do { code = randomCode(6); } while (store.byCode[code]);
+    }
+
+    const entry = {
+      code,
+      url,
+      createdAt: now(),
+      expiresAt: now() + minutes(vMin),
+      hits: 0,
+    };
+    store.byCode[code] = entry;
+    saveStore(store);
+    return entry;
+  },
+  async resolve(code) {
+    const store = loadStore();
+    const entry = store.byCode[code];
+    if (!entry) throw new Error("Unknown short code");
+    if (now() > entry.expiresAt) throw new Error("Link has expired");
+    // increment hits on read
+    entry.hits += 1;
+    saveStore(store);
+    return entry;
+  },
+  async stats() {
+    const store = loadStore();
+    const list = Object.values(store.byCode).sort((a, b) => b.createdAt - a.createdAt);
+    return list;
+  },
+};
+
+const api = withLogging(rawApi);
+
+/**********************
+ * UI Components
+ **********************/
+function App() {
+  return (
+    <BrowserRouter>
+      <div className="min-h-screen bg-slate-50 text-slate-900">
+        <Header />
+        <main className="max-w-3xl mx-auto p-4">
+          <Routes>
+            <Route path="/" element={<CreatePage />} />
+            <Route path="/result/:code" element={<ResultPage />} />
+            <Route path="/stats" element={<StatsPage />} />
+            <Route path=":code" element={<Redirector />} />
+            <Route path="*" element={<NotFound />} />
+          </Routes>
+        </main>
+      </div>
+    </BrowserRouter>
+  );
+}
+
+function Header() {
+  return (
+    <header className="border-b bg-white/70 backdrop-blur sticky top-0 z-10">
+      <div className="max-w-3xl mx-auto p-4 flex items-center justify-between">
+        <Link to="/" className="font-bold text-xl">Shorty 🔗</Link>
+        <nav className="flex gap-4 text-sm">
+          <Link className="hover:underline" to="/">Create</Link>
+          <Link className="hover:underline" to="/stats">Statistics</Link>
+        </nav>
+      </div>
+    </header>
+  );
+}
+
+function Card({ children }) {
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border p-4 md:p-6">{children}</div>
+  );
+}
+
+function Field({ label, children, hint }) {
+  return (
+    <div className="space-y-1">
+      <label className="block text-sm font-medium">{label}</label>
+      {children}
+      {hint && <p className="text-xs text-slate-500">{hint}</p>}
+    </div>
+  );
+}
+
+function CreatePage() {
+  const navigate = useNavigate();
+  const [url, setUrl] = useState("");
+  const [validity, setValidity] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setError("");
+    try {
+      const entry = await api.createShort({ url, validityMinutes: validity ? parseInt(validity) : undefined, customCode: code || undefined });
+      navigate(`/result/${entry.code}`);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="grid gap-4">
+      <Card>
+        <h1 className="text-2xl font-semibold mb-4">Create a Short Link</h1>
+        <form onSubmit={handleSubmit} className="grid gap-3">
+          <Field label="Long URL" hint="Must start with http:// or https://">
+            <input value={url} onChange={(e)=>setUrl(e.target.value)} type="url" required placeholder="https://example.com/article?id=123" className="w-full rounded-xl border px-3 py-2" />
+          </Field>
+          <div className="grid md:grid-cols-2 gap-3">
+            <Field label="Custom shortcode (optional)" hint="4–16 letters/numbers. Leave blank to auto-generate.">
+              <input value={code} onChange={(e)=>setCode(e.target.value)} type="text" placeholder="myCustom123" className="w-full rounded-xl border px-3 py-2" />
+            </Field>
+            <Field label="Validity in minutes (optional)" hint="Defaults to 30 minutes if left empty.">
+              <input value={validity} onChange={(e)=>setValidity(e.target.value)} type="number" min="1" step="1" placeholder="30" className="w-full rounded-xl border px-3 py-2" />
+            </Field>
+          </div>
+          {error && <div className="text-red-600 text-sm">{error}</div>}
+          <button disabled={busy} className="rounded-xl bg-slate-900 text-white px-4 py-2 disabled:opacity-60">{busy ? "Creating…" : "Shorten URL"}</button>
+        </form>
+      </Card>
+      <LogPanel />
+    </div>
+  );
+}
+
+function ResultPage() {
+  const { code } = useParams();
+  const origin = window.location.origin;
+  const shortUrl = `${origin}/${code}`;
+  return (
+    <Card>
+      <h2 className="text-xl font-semibold mb-2">Short Link Ready</h2>
+      <div className="grid gap-2">
+        <div className="flex items-center gap-2">
+          <input readOnly value={shortUrl} className="w-full rounded-xl border px-3 py-2" />
+          <CopyButton text={shortUrl} />
+        </div>
+        <p className="text-sm text-slate-600">Share this link. It will redirect via client-side routing.</p>
+        <div>
+          <Link to="/" className="underline text-sm">Create another →</Link>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function CopyButton({ text }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={async ()=>{ await navigator.clipboard.writeText(text); setCopied(true); setTimeout(()=>setCopied(false), 1200); }}
+      className="rounded-xl border px-3 py-2">
+      {copied ? "Copied" : "Copy"}
+    </button>
+  );
+}
+
+function StatsPage() {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState("");
+  useEffect(() => { (async () => {
+    try { setRows(await api.stats()); } catch (e) { setError(e.message || String(e)); }
+  })(); }, []);
+  const origin = window.location.origin;
+
+  return (
+    <div className="grid gap-4">
+      <Card>
+        <h2 className="text-xl font-semibold mb-2">Statistics</h2>
+        {error && <div className="text-red-600 text-sm mb-2">{error}</div>}
+        <div className="overflow-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left border-b">
+                <th className="py-2 pr-3">Short</th>
+                <th className="py-2 pr-3">Destination</th>
+                <th className="py-2 pr-3">Created</th>
+                <th className="py-2 pr-3">Expires</th>
+                <th className="py-2 pr-3">Hits</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(r => (
+                <tr key={r.code} className="border-b">
+                  <td className="py-2 pr-3"><a className="underline" href={`${origin}/${r.code}`} target="_blank" rel="noreferrer">/{r.code}</a></td>
+                  <td className="py-2 pr-3 max-w-[260px] truncate" title={r.url}>{r.url}</td>
+                  <td className="py-2 pr-3">{new Date(r.createdAt).toLocaleString()}</td>
+                  <td className="py-2 pr-3">{new Date(r.expiresAt).toLocaleString()}</td>
+                  <td className="py-2 pr-3">{r.hits}</td>
+                </tr>
+              ))}
+              {!rows.length && (
+                <tr>
+                  <td colSpan="5" className="py-6 text-center text-slate-500">No data yet</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+      <LogPanel />
+    </div>
+  );
+}
+
+function Redirector() {
+  const { code } = useParams();
+  const [status, setStatus] = useState("Resolving…");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const entry = await api.resolve(code);
+        setStatus("Redirecting…");
+        // client-side redirection
+        window.location.replace(entry.url);
+      } catch (e) {
+        setError(e.message || String(e));
+        setStatus("");
+      }
+    })();
+  }, [code]);
+
+  return (
+    <Card>
+      <h2 className="text-xl font-semibold mb-2">/{code}</h2>
+      {status && <p>{status}</p>}
+      {error && <p className="text-red-600">{error}</p>}
+      {error && <Link to="/" className="underline text-sm">Go home</Link>}
+    </Card>
+  );
+}
+
+function NotFound() {
+  return (
+    <Card>
+      <h2 className="text-xl font-semibold mb-2">Not found</h2>
+      <Link to="/" className="underline">Return home</Link>
+    </Card>
+  );
+}
+
+function LogPanel() {
+  // live view of our custom middleware logs
+  const [, force] = useState(0);
+  const timerRef = useRef(null);
+  useEffect(() => {
+    timerRef.current = setInterval(() => force((n) => n + 1), 500);
+    return () => clearInterval(timerRef.current);
+  }, []);
+  const events = logger.getAll().slice().reverse();
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="font-semibold">Logging Middleware Events</h3>
+        <button onClick={() => { logger.clear(); force(n=>n+1); }} className="text-sm underline">Clear</button>
+      </div>
+      <ul className="space-y-1 max-h-48 overflow-auto text-xs font-mono">
+        {events.map(ev => (
+          <li key={ev.id} className="grid grid-cols-12 gap-2">
+            <span className="col-span-2 text-slate-500">{new Date(ev.ts).toLocaleTimeString()}</span>
+            <span className="col-span-2">{ev.level}</span>
+            <span className="col-span-8 truncate" title={JSON.stringify(ev.meta)}>{ev.message} {ev.meta?.fn ? `(${ev.meta.fn})` : ""}</span>
+          </li>
+        ))}
+        {!events.length && <li className="text-slate-500">No logs yet</li>}
+      </ul>
+    </Card>
+  );
+}
+
+export default App;
 
